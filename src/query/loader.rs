@@ -1,15 +1,12 @@
 use crate::{
-    Condition, ConnectionTrait, DbErr, EntityTrait, Identity, ModelTrait, QueryFilter, Related,
-    RelationType, Select, error::*,
+    ColumnTrait, Condition, ConnectionTrait, DbErr, EntityTrait, Identity, ModelTrait, QueryFilter,
+    Related, RelationType, Select, error::*,
 };
 use async_trait::async_trait;
 use sea_query::{
     ColumnRef, DynIden, Expr, ExprTrait, IntoColumnRef, SimpleExpr, TableRef, ValueTuple,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::{collections::HashMap, str::FromStr};
 
 /// Entity, or a Select<Entity>; to be used as parameters in [`LoaderTrait`]
 pub trait EntityOrSelect<E: EntityTrait>: Send {
@@ -166,16 +163,18 @@ where
         let hashmap = data.into_iter().try_fold(
             HashMap::<ValueTuple, <R as EntityTrait>::Model>::new(),
             |mut acc, value| {
-                extract_key(&rel_def.to_col, &value).map(|key| {
-                    acc.insert(key, value);
+                extract_key(&rel_def.to_col, &value).map(|(key_value, _)| {
+                    acc.insert(key_value, value);
 
                     acc
                 })
             },
         )?;
 
-        let result: Vec<Option<<R as EntityTrait>::Model>> =
-            keys.iter().map(|key| hashmap.get(key).cloned()).collect();
+        let result: Vec<Option<<R as EntityTrait>::Model>> = keys
+            .iter()
+            .map(|(key_value, _)| hashmap.get(key_value).cloned())
+            .collect();
 
         Ok(result)
     }
@@ -213,17 +212,18 @@ where
 
         let data = stmt.all(db).await?;
 
-        let mut hashmap: HashMap<ValueTuple, Vec<<R as EntityTrait>::Model>> =
-            keys.iter()
-                .fold(HashMap::new(), |mut acc, key: &ValueTuple| {
-                    acc.insert(key.clone(), Vec::new());
-                    acc
-                });
+        let mut hashmap: HashMap<ValueTuple, Vec<<R as EntityTrait>::Model>> = keys.iter().fold(
+            HashMap::new(),
+            |mut acc, (key_value, _): &(ValueTuple, Vec<Expr>)| {
+                acc.insert(key_value.clone(), Vec::new());
+                acc
+            },
+        );
 
         for value in data {
             let key = extract_key(&rel_def.to_col, &value)?;
 
-            let vec = hashmap.get_mut(&key).ok_or_else(|| {
+            let vec = hashmap.get_mut(&key.0).ok_or_else(|| {
                 DbErr::RecordNotFound(format!("Loader: failed to find model for {key:?}"))
             })?;
 
@@ -232,7 +232,9 @@ where
 
         let result: Vec<Vec<R::Model>> = keys
             .iter()
-            .map(|key: &ValueTuple| hashmap.get(key).cloned().unwrap_or_default())
+            .map(|(key_value, _): &(ValueTuple, Vec<Expr>)| {
+                hashmap.get(&key_value).cloned().unwrap_or_default()
+            })
             .collect();
 
         Ok(result)
@@ -280,14 +282,14 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Map of M::PK -> Vec<R::PK>
-            let mut keymap: HashMap<ValueTuple, Vec<ValueTuple>> = Default::default();
+            let mut keymap: HashMap<ValueTuple, Vec<(ValueTuple, Vec<Expr>)>> = Default::default();
 
-            let keys: Vec<ValueTuple> = {
+            let keys: Vec<(ValueTuple, Vec<Expr>)> = {
                 let condition = prepare_condition(&via_rel.to_tbl, &via_rel.to_col, &pkeys);
                 let stmt = V::find().filter(condition);
                 let data = stmt.all(db).await?;
                 for model in data {
-                    let pk = extract_key(&via_rel.to_col, &model)?;
+                    let (pk, _) = extract_key(&via_rel.to_col, &model)?;
                     let entry = keymap.entry(pk).or_default();
 
                     let fk = extract_key(&rel_def.from_col, &model)?;
@@ -307,8 +309,8 @@ where
             let data = models.into_iter().try_fold(
                 HashMap::<ValueTuple, <R as EntityTrait>::Model>::new(),
                 |mut acc, model| {
-                    extract_key(&rel_def.to_col, &model).map(|key| {
-                        acc.insert(key, model);
+                    extract_key(&rel_def.to_col, &model).map(|(key_value, _)| {
+                        acc.insert(key_value, model);
 
                         acc
                     })
@@ -317,12 +319,12 @@ where
 
             let result: Vec<Vec<R::Model>> = pkeys
                 .into_iter()
-                .map(|pkey| {
-                    let fkeys = keymap.get(&pkey).cloned().unwrap_or_default();
+                .map(|(pkey_value, _)| {
+                    let fkeys = keymap.get(&pkey_value).cloned().unwrap_or_default();
 
                     let models: Vec<_> = fkeys
                         .into_iter()
-                        .filter_map(|fkey| data.get(&fkey).cloned())
+                        .filter_map(|(fkey_value, _)| data.get(&fkey_value).cloned())
                         .collect();
 
                     models
@@ -341,7 +343,10 @@ fn cmp_table_ref(left: &TableRef, right: &TableRef) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
 
-fn extract_key<Model>(target_col: &Identity, model: &Model) -> Result<ValueTuple, DbErr>
+fn extract_key<Model>(
+    target_col: &Identity,
+    model: &Model,
+) -> Result<(ValueTuple, Vec<Expr>), DbErr>
 where
     Model: ModelTrait,
 {
@@ -351,7 +356,10 @@ where
             let column_a =
                 <<<Model as ModelTrait>::Entity as EntityTrait>::Column as FromStr>::from_str(&a)
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{a}' to column A:1")))?;
-            ValueTuple::One(model.get(column_a))
+            (
+                ValueTuple::One(model.get(column_a)),
+                vec![column_a.save_as(Expr::val(model.get(column_a)))],
+            )
         }
         Identity::Binary(a, b) => {
             let a = a.to_string();
@@ -362,7 +370,13 @@ where
             let column_b =
                 <<<Model as ModelTrait>::Entity as EntityTrait>::Column as FromStr>::from_str(&b)
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{b}' to column B:2")))?;
-            ValueTuple::Two(model.get(column_a), model.get(column_b))
+            (
+                ValueTuple::Two(model.get(column_a), model.get(column_b)),
+                vec![
+                    column_a.save_as(Expr::val(model.get(column_a))),
+                    column_b.save_as(Expr::val(model.get(column_b))),
+                ],
+            )
         }
         Identity::Ternary(a, b, c) => {
             let a = a.to_string();
@@ -383,14 +397,22 @@ where
                     &c.to_string(),
                 )
                 .map_err(|_| DbErr::Type(format!("Failed at mapping '{c}' to column C:3")))?;
-            ValueTuple::Three(
-                model.get(column_a),
-                model.get(column_b),
-                model.get(column_c),
+            (
+                ValueTuple::Three(
+                    model.get(column_a),
+                    model.get(column_b),
+                    model.get(column_c),
+                ),
+                vec![
+                    column_a.save_as(Expr::val(model.get(column_a))),
+                    column_b.save_as(Expr::val(model.get(column_b))),
+                    column_c.save_as(Expr::val(model.get(column_c))),
+                ],
             )
         }
         Identity::Many(cols) => {
             let mut values = Vec::new();
+            let mut exprs = Vec::new();
             for col in cols {
                 let col_name = col.to_string();
                 let column =
@@ -398,32 +420,32 @@ where
                         &col_name,
                     )
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{col_name}' to colum")))?;
-                values.push(model.get(column))
+                values.push(model.get(column));
+                exprs.push(column.save_as(Expr::val(model.get(column))))
             }
-            ValueTuple::Many(values)
+            (ValueTuple::Many(values), exprs)
         }
     })
 }
 
-fn prepare_condition(table: &TableRef, col: &Identity, keys: &[ValueTuple]) -> Condition {
-    let keys = if !keys.is_empty() {
-        let set: HashSet<_> = keys.iter().cloned().collect();
-        set.into_iter().collect()
-    } else {
-        Vec::new()
-    };
+fn prepare_condition(
+    table: &TableRef,
+    col: &Identity,
+    keys: &Vec<(ValueTuple, Vec<Expr>)>,
+) -> Condition {
+    let keys: Vec<Expr> = keys.into_iter().map(|m| Expr::Tuple(m.1.clone())).collect();
 
     match col {
         Identity::Unary(column_a) => {
             let column_a = table_column(table, column_a);
-            Condition::all().add(Expr::col(column_a).is_in(keys.into_iter().flatten()))
+            Condition::all().add(Expr::col(column_a).is_in(keys))
         }
         Identity::Binary(column_a, column_b) => Condition::all().add(
             Expr::tuple([
                 SimpleExpr::Column(table_column(table, column_a)),
                 SimpleExpr::Column(table_column(table, column_b)),
             ])
-            .in_tuples(keys),
+            .is_in(keys),
         ),
         Identity::Ternary(column_a, column_b, column_c) => Condition::all().add(
             Expr::tuple([
@@ -431,13 +453,13 @@ fn prepare_condition(table: &TableRef, col: &Identity, keys: &[ValueTuple]) -> C
                 SimpleExpr::Column(table_column(table, column_b)),
                 SimpleExpr::Column(table_column(table, column_c)),
             ])
-            .in_tuples(keys),
+            .is_in(keys),
         ),
         Identity::Many(cols) => {
             let columns = cols
                 .iter()
                 .map(|col| SimpleExpr::Column(table_column(table, col)));
-            Condition::all().add(Expr::tuple(columns).in_tuples(keys))
+            Condition::all().add(Expr::tuple(columns).is_in(keys))
         }
     }
 }

@@ -41,7 +41,6 @@ pub trait ConnectionTrait: Sync {
     async fn query_all<S: StatementBuilder>(&self, stmt: &S) -> Result<Vec<QueryResult>, DbErr> {
         let db_backend = self.get_database_backend();
         let stmt = db_backend.build(stmt);
-        println!("{}", stmt.to_string());
         self.query_all_raw(stmt).await
     }
 
