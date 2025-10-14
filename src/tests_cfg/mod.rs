@@ -14,6 +14,7 @@ pub mod lunch_set;
 pub mod lunch_set_expanded;
 pub mod rust_keyword;
 pub mod sea_orm_active_enums;
+pub mod tea_blend;
 pub mod vendor;
 
 pub use cake::Entity as Cake;
@@ -25,4 +26,5 @@ pub use fruit::Entity as Fruit;
 pub use lunch_set::Entity as LunchSet;
 pub use lunch_set_expanded::Entity as LunchSetExpanded;
 pub use rust_keyword::Entity as RustKeyword;
+pub use tea_blend::Entity as LunchTeaBlend;
 pub use vendor::Entity as Vendor;

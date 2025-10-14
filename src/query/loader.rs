@@ -450,6 +450,8 @@ fn table_column(tbl: &TableRef, col: &DynIden) -> ColumnRef {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::tests_cfg::sea_orm_active_enums::Tea as DbTea;
+
     fn cake_model(id: i32) -> sea_orm::tests_cfg::cake::Model {
         let name = match id {
             1 => "apple cake",
@@ -498,6 +500,49 @@ mod tests {
         sea_orm::tests_cfg::cake_filling::Model {
             cake_id,
             filling_id,
+        }
+    }
+
+    fn lunch_set_model(id: i32) -> sea_orm::tests_cfg::lunch_set::Model {
+        let tea = if id % 2 == 0 {
+            DbTea::BreakfastTea
+        } else {
+            DbTea::EverydayTea
+        };
+
+        sea_orm::tests_cfg::lunch_set::Model {
+            id,
+            name: "".to_string(),
+            tea,
+        }
+    }
+
+    fn tea_blend_model(tea: DbTea) -> Vec<sea_orm::tests_cfg::tea_blend::Model> {
+        match tea {
+            // English breakfast tea
+            DbTea::BreakfastTea => vec![
+                sea_orm::tests_cfg::tea_blend::Model {
+                    tea: tea.clone(),
+                    blend_part_variety: "Keemun".to_string(),
+                    mass_grams: 8,
+                },
+                sea_orm::tests_cfg::tea_blend::Model {
+                    tea: tea.clone(),
+                    blend_part_variety: "Ceylon".to_string(),
+                    mass_grams: 3,
+                },
+                sea_orm::tests_cfg::tea_blend::Model {
+                    tea,
+                    blend_part_variety: "Assam".to_string(),
+                    mass_grams: 3,
+                },
+            ],
+            // Single variety
+            DbTea::EverydayTea => vec![sea_orm::tests_cfg::tea_blend::Model {
+                tea,
+                blend_part_variety: "DaHongPao".to_string(),
+                mass_grams: 1,
+            }],
         }
     }
 
@@ -756,5 +801,128 @@ mod tests {
 
         let values_count = sql.matches("$1").count() + sql.matches("$2").count();
         assert_eq!(values_count, 2, "Duplicate values were not removed");
+    }
+
+    async fn prepare_load_many_custom_enum_key_real_postgres(
+        test_name: &str,
+    ) -> sea_orm::DatabaseConnection {
+        use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+        let base_url = std::env::var("DATABASE_URL").unwrap();
+
+        let url = format!("{base_url}/postgres");
+        let db = Database::connect(&url).await.unwrap();
+        let _drop_db_result = db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DROP DATABASE IF EXISTS \"{test_name}\";"),
+            ))
+            .await;
+
+        let _create_db_result = db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("CREATE DATABASE \"{test_name}\";"),
+            ))
+            .await;
+
+        let url = format!("{base_url}/{test_name}");
+        let db = Database::connect(&url).await.unwrap();
+
+        db.execute_unprepared(
+            r#"
+                -- Cleanup: Drop tables and types if they exist
+                DROP TABLE IF EXISTS tea_blend CASCADE;
+                DROP TABLE IF EXISTS lunch_set CASCADE;
+                DROP TYPE IF EXISTS tea CASCADE;
+
+                -- Create enum types
+                CREATE TYPE tea AS ENUM ('EverydayTea', 'BreakfastTea');
+
+                -- Create tables
+                CREATE TABLE lunch_set (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR NOT NULL,
+                    tea tea NOT NULL
+                );
+
+                CREATE TABLE tea_blend (
+                    tea tea NOT NULL,
+                    blend_part_variety TEXT NOT NULL,
+                    mass_grams INTEGER NOT NULL,
+                    PRIMARY KEY (tea, blend_part_variety)
+                );
+
+                -- Insert lunch_set data
+                INSERT INTO lunch_set (id, name, tea) VALUES 
+                    (0, '', 'BreakfastTea'),
+                    (1, '', 'EverydayTea'),
+                    (2, '', 'BreakfastTea');
+
+                -- Insert tea_blend data
+                -- BreakfastTea blends
+                INSERT INTO tea_blend (tea, blend_part_variety, mass_grams) VALUES 
+                    ('BreakfastTea', 'Keemun', 8),
+                    ('BreakfastTea', 'Ceylon', 3),
+                    ('BreakfastTea', 'Assam', 3);
+
+                -- EverydayTea blends
+                INSERT INTO tea_blend (tea, blend_part_variety, mass_grams) VALUES 
+                    ('EverydayTea', 'DaHongPao', 1);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        db
+    }
+
+    async fn load_many_custom_enum_key(db: &sea_orm::DatabaseConnection) {
+        use sea_orm::{entity::prelude::*, tests_cfg::*, LoaderTrait};
+
+        let lunch_sets = vec![lunch_set_model(0), lunch_set_model(1), lunch_set_model(2)];
+
+        let tea_blends_contents = lunch_sets
+            .load_many(tea_blend::Entity::find(), db)
+            .await
+            .expect("Should return something");
+
+        assert_eq!(
+            tea_blends_contents,
+            [
+                tea_blend_model(DbTea::BreakfastTea),
+                tea_blend_model(DbTea::EverydayTea),
+                tea_blend_model(DbTea::BreakfastTea),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_many_custom_enum_key_real_postgres() {
+        // initializing postgres
+        let db = prepare_load_many_custom_enum_key_real_postgres(
+            "test_load_many_custom_enum_key_real_postgres",
+        )
+        .await;
+
+        // fails
+        load_many_custom_enum_key(&db).await;
+    }
+
+    #[tokio::test]
+    async fn test_load_many_custom_enum_key() {
+        use sea_orm::{DbBackend, MockDatabase};
+
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[
+                tea_blend_model(DbTea::BreakfastTea).into_iter(),
+                tea_blend_model(DbTea::EverydayTea).into_iter(),
+            ]
+            .into_iter()
+            .flatten()])
+            .into_connection();
+
+        // works as intended
+        load_many_custom_enum_key(&db).await;
     }
 }
