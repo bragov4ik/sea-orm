@@ -161,8 +161,8 @@ where
         let hashmap = data.into_iter().try_fold(
             HashMap::<ValueTuple, <R as EntityTrait>::Model>::new(),
             |mut acc, value| {
-                extract_key(&rel_def.to_col, &value).map(|(key_value, _)| {
-                    acc.insert(key_value, value);
+                extract_key(&rel_def.to_col, &value).map(|key| {
+                    acc.insert(key.values, value);
 
                     acc
                 })
@@ -171,7 +171,7 @@ where
 
         let result: Vec<Option<<R as EntityTrait>::Model>> = keys
             .iter()
-            .map(|(key_value, _)| hashmap.get(key_value).cloned())
+            .map(|key| hashmap.get(&key.values).cloned())
             .collect();
 
         Ok(result)
@@ -210,19 +210,17 @@ where
 
         let data = stmt.all(db).await?;
 
-        let mut hashmap: HashMap<ValueTuple, Vec<<R as EntityTrait>::Model>> = keys.iter().fold(
-            HashMap::new(),
-            |mut acc, (key_value, _): &(ValueTuple, Vec<SimpleExpr>)| {
-                acc.insert(key_value.clone(), Vec::new());
+        let mut hashmap: HashMap<ValueTuple, Vec<<R as EntityTrait>::Model>> =
+            keys.iter().fold(HashMap::new(), |mut acc, key: &Key| {
+                acc.insert(key.values.clone(), Vec::new());
                 acc
-            },
-        );
+            });
 
         for value in data {
-            let key = extract_key(&rel_def.to_col, &value)?;
+            let key_values = extract_key(&rel_def.to_col, &value)?.values;
 
-            let vec = hashmap.get_mut(&key.0).ok_or_else(|| {
-                DbErr::RecordNotFound(format!("Loader: failed to find model for {key:?}"))
+            let vec = hashmap.get_mut(&key_values).ok_or_else(|| {
+                DbErr::RecordNotFound(format!("Loader: failed to find model for {key_values:?}"))
             })?;
 
             vec.push(value);
@@ -230,9 +228,7 @@ where
 
         let result: Vec<Vec<R::Model>> = keys
             .iter()
-            .map(|(key_value, _): &(ValueTuple, Vec<SimpleExpr>)| {
-                hashmap.get(&key_value).cloned().unwrap_or_default()
-            })
+            .map(|key: &Key| hashmap.get(&key.values).cloned().unwrap_or_default())
             .collect();
 
         Ok(result)
@@ -280,16 +276,15 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Map of M::PK -> Vec<R::PK>
-            let mut keymap: HashMap<ValueTuple, Vec<(ValueTuple, Vec<SimpleExpr>)>> =
-                Default::default();
+            let mut keymap: HashMap<ValueTuple, Vec<Key>> = Default::default();
 
-            let keys: Vec<(ValueTuple, Vec<SimpleExpr>)> = {
+            let keys: Vec<Key> = {
                 let condition = prepare_condition(&via_rel.to_tbl, &via_rel.to_col, &pkeys);
                 let stmt = V::find().filter(condition);
                 let data = stmt.all(db).await?;
                 for model in data {
-                    let (pk, _) = extract_key(&via_rel.to_col, &model)?;
-                    let entry = keymap.entry(pk).or_default();
+                    let pk_values = extract_key(&via_rel.to_col, &model)?.values;
+                    let entry = keymap.entry(pk_values).or_default();
 
                     let fk = extract_key(&rel_def.from_col, &model)?;
                     entry.push(fk);
@@ -308,8 +303,8 @@ where
             let data = models.into_iter().try_fold(
                 HashMap::<ValueTuple, <R as EntityTrait>::Model>::new(),
                 |mut acc, model| {
-                    extract_key(&rel_def.to_col, &model).map(|(key_value, _)| {
-                        acc.insert(key_value, model);
+                    extract_key(&rel_def.to_col, &model).map(|key| {
+                        acc.insert(key.values, model);
 
                         acc
                     })
@@ -318,12 +313,12 @@ where
 
             let result: Vec<Vec<R::Model>> = pkeys
                 .into_iter()
-                .map(|(pkey_value, _)| {
-                    let fkeys = keymap.get(&pkey_value).cloned().unwrap_or_default();
+                .map(|pkey| {
+                    let fkeys = keymap.get(&pkey.values).cloned().unwrap_or_default();
 
                     let models: Vec<_> = fkeys
                         .into_iter()
-                        .filter_map(|(fkey_value, _)| data.get(&fkey_value).cloned())
+                        .filter_map(|fkey| data.get(&fkey.values).cloned())
                         .collect();
 
                     models
@@ -342,10 +337,21 @@ fn cmp_table_ref(left: &TableRef, right: &TableRef) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
 
-fn extract_key<Model>(
-    target_col: &Identity,
-    model: &Model,
-) -> Result<(ValueTuple, Vec<SimpleExpr>), DbErr>
+/// Key that connects models.
+///
+/// It consists of two representations:
+/// - `values`: key as Value variants ([`sea_orm::Value`](crate::Value)); hashable
+/// - `exprs`: key as database storage-friendly expressions
+/// (see [`sea_orm::ColumnTrait::save_as`](crate::ColumnTrait::save_as)); non-hashable
+#[derive(Clone, Debug)]
+struct Key {
+    values: ValueTuple,
+    exprs: Vec<SimpleExpr>,
+}
+
+impl Key {}
+
+fn extract_key<Model>(target_col: &Identity, model: &Model) -> Result<Key, DbErr>
 where
     Model: ModelTrait,
 {
@@ -355,10 +361,10 @@ where
             let column_a =
                 <<<Model as ModelTrait>::Entity as EntityTrait>::Column as FromStr>::from_str(&a)
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{a}' to column A:1")))?;
-            (
-                ValueTuple::One(model.get(column_a)),
-                vec![column_a.save_as(Expr::val(model.get(column_a)))],
-            )
+            Key {
+                values: ValueTuple::One(model.get(column_a)),
+                exprs: vec![column_a.save_as(Expr::val(model.get(column_a)))],
+            }
         }
         Identity::Binary(a, b) => {
             let a = a.to_string();
@@ -369,13 +375,13 @@ where
             let column_b =
                 <<<Model as ModelTrait>::Entity as EntityTrait>::Column as FromStr>::from_str(&b)
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{b}' to column B:2")))?;
-            (
-                ValueTuple::Two(model.get(column_a), model.get(column_b)),
-                vec![
+            Key {
+                values: ValueTuple::Two(model.get(column_a), model.get(column_b)),
+                exprs: vec![
                     column_a.save_as(Expr::val(model.get(column_a))),
                     column_b.save_as(Expr::val(model.get(column_b))),
                 ],
-            )
+            }
         }
         Identity::Ternary(a, b, c) => {
             let a = a.to_string();
@@ -396,18 +402,18 @@ where
                     &c.to_string(),
                 )
                 .map_err(|_| DbErr::Type(format!("Failed at mapping '{c}' to column C:3")))?;
-            (
-                ValueTuple::Three(
+            Key {
+                values: ValueTuple::Three(
                     model.get(column_a),
                     model.get(column_b),
                     model.get(column_c),
                 ),
-                vec![
+                exprs: vec![
                     column_a.save_as(Expr::val(model.get(column_a))),
                     column_b.save_as(Expr::val(model.get(column_b))),
                     column_c.save_as(Expr::val(model.get(column_c))),
                 ],
-            )
+            }
         }
         Identity::Many(cols) => {
             let mut values = Vec::new();
@@ -422,19 +428,18 @@ where
                 values.push(model.get(column));
                 exprs.push(column.save_as(Expr::val(model.get(column))))
             }
-            (ValueTuple::Many(values), exprs)
+            Key {
+                values: ValueTuple::Many(values),
+                exprs,
+            }
         }
     })
 }
 
-fn prepare_condition(
-    table: &TableRef,
-    col: &Identity,
-    keys: &Vec<(ValueTuple, Vec<SimpleExpr>)>,
-) -> Condition {
+fn prepare_condition(table: &TableRef, col: &Identity, keys: &Vec<Key>) -> Condition {
     let keys: Vec<SimpleExpr> = keys
         .into_iter()
-        .map(|m| SimpleExpr::Tuple(m.1.clone()))
+        .map(|m| SimpleExpr::Tuple(m.exprs.clone()))
         .collect();
 
     match col {
