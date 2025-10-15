@@ -1,15 +1,12 @@
 use crate::{
-    Condition, ConnectionTrait, DbErr, EntityTrait, Identity, ModelTrait, QueryFilter, Related,
-    RelationType, Select, error::*,
+    ColumnTrait, Condition, ConnectionTrait, DbErr, EntityTrait, Identity, ModelTrait, QueryFilter,
+    Related, RelationType, Select, error::*,
 };
 use async_trait::async_trait;
 use sea_query::{
     ColumnRef, DynIden, Expr, ExprTrait, IntoColumnRef, SimpleExpr, TableRef, ValueTuple,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::{collections::HashMap, str::FromStr};
 
 /// Entity, or a Select<Entity>; to be used as parameters in [`LoaderTrait`]
 pub trait EntityOrSelect<E: EntityTrait>: Send {
@@ -167,15 +164,17 @@ where
             HashMap::<ValueTuple, <R as EntityTrait>::Model>::new(),
             |mut acc, value| {
                 extract_key(&rel_def.to_col, &value).map(|key| {
-                    acc.insert(key, value);
+                    acc.insert(key.values, value);
 
                     acc
                 })
             },
         )?;
 
-        let result: Vec<Option<<R as EntityTrait>::Model>> =
-            keys.iter().map(|key| hashmap.get(key).cloned()).collect();
+        let result: Vec<Option<<R as EntityTrait>::Model>> = keys
+            .iter()
+            .map(|key| hashmap.get(&key.values).cloned())
+            .collect();
 
         Ok(result)
     }
@@ -214,17 +213,16 @@ where
         let data = stmt.all(db).await?;
 
         let mut hashmap: HashMap<ValueTuple, Vec<<R as EntityTrait>::Model>> =
-            keys.iter()
-                .fold(HashMap::new(), |mut acc, key: &ValueTuple| {
-                    acc.insert(key.clone(), Vec::new());
-                    acc
-                });
+            keys.iter().fold(HashMap::new(), |mut acc, key: &Key| {
+                acc.insert(key.values.clone(), Vec::new());
+                acc
+            });
 
         for value in data {
-            let key = extract_key(&rel_def.to_col, &value)?;
+            let key_values = extract_key(&rel_def.to_col, &value)?.values;
 
-            let vec = hashmap.get_mut(&key).ok_or_else(|| {
-                DbErr::RecordNotFound(format!("Loader: failed to find model for {key:?}"))
+            let vec = hashmap.get_mut(&key_values).ok_or_else(|| {
+                DbErr::RecordNotFound(format!("Loader: failed to find model for {key_values:?}"))
             })?;
 
             vec.push(value);
@@ -232,7 +230,7 @@ where
 
         let result: Vec<Vec<R::Model>> = keys
             .iter()
-            .map(|key: &ValueTuple| hashmap.get(key).cloned().unwrap_or_default())
+            .map(|key: &Key| hashmap.get(&key.values).cloned().unwrap_or_default())
             .collect();
 
         Ok(result)
@@ -280,15 +278,15 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Map of M::PK -> Vec<R::PK>
-            let mut keymap: HashMap<ValueTuple, Vec<ValueTuple>> = Default::default();
+            let mut keymap: HashMap<ValueTuple, Vec<Key>> = Default::default();
 
-            let keys: Vec<ValueTuple> = {
+            let keys: Vec<Key> = {
                 let condition = prepare_condition(&via_rel.to_tbl, &via_rel.to_col, &pkeys);
                 let stmt = V::find().filter(condition);
                 let data = stmt.all(db).await?;
                 for model in data {
-                    let pk = extract_key(&via_rel.to_col, &model)?;
-                    let entry = keymap.entry(pk).or_default();
+                    let pk_values = extract_key(&via_rel.to_col, &model)?.values;
+                    let entry = keymap.entry(pk_values).or_default();
 
                     let fk = extract_key(&rel_def.from_col, &model)?;
                     entry.push(fk);
@@ -308,7 +306,7 @@ where
                 HashMap::<ValueTuple, <R as EntityTrait>::Model>::new(),
                 |mut acc, model| {
                     extract_key(&rel_def.to_col, &model).map(|key| {
-                        acc.insert(key, model);
+                        acc.insert(key.values, model);
 
                         acc
                     })
@@ -318,11 +316,11 @@ where
             let result: Vec<Vec<R::Model>> = pkeys
                 .into_iter()
                 .map(|pkey| {
-                    let fkeys = keymap.get(&pkey).cloned().unwrap_or_default();
+                    let fkeys = keymap.get(&pkey.values).cloned().unwrap_or_default();
 
                     let models: Vec<_> = fkeys
                         .into_iter()
-                        .filter_map(|fkey| data.get(&fkey).cloned())
+                        .filter_map(|fkey| data.get(&fkey.values).cloned())
                         .collect();
 
                     models
@@ -341,7 +339,21 @@ fn cmp_table_ref(left: &TableRef, right: &TableRef) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
 
-fn extract_key<Model>(target_col: &Identity, model: &Model) -> Result<ValueTuple, DbErr>
+/// Key that connects models.
+///
+/// It consists of two representations:
+/// - `values`: key as Value variants ([`sea_orm::Value`](crate::Value)); hashable
+/// - `exprs`: key as database storage-friendly expressions
+/// (see [`sea_orm::ColumnTrait::save_as`](crate::ColumnTrait::save_as)); non-hashable
+#[derive(Clone, Debug)]
+struct Key {
+    values: ValueTuple,
+    exprs: Vec<Expr>,
+}
+
+impl Key {}
+
+fn extract_key<Model>(target_col: &Identity, model: &Model) -> Result<Key, DbErr>
 where
     Model: ModelTrait,
 {
@@ -351,7 +363,10 @@ where
             let column_a =
                 <<<Model as ModelTrait>::Entity as EntityTrait>::Column as FromStr>::from_str(&a)
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{a}' to column A:1")))?;
-            ValueTuple::One(model.get(column_a))
+            Key {
+                values: ValueTuple::One(model.get(column_a)),
+                exprs: vec![column_a.save_as(Expr::val(model.get(column_a)))],
+            }
         }
         Identity::Binary(a, b) => {
             let a = a.to_string();
@@ -362,7 +377,13 @@ where
             let column_b =
                 <<<Model as ModelTrait>::Entity as EntityTrait>::Column as FromStr>::from_str(&b)
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{b}' to column B:2")))?;
-            ValueTuple::Two(model.get(column_a), model.get(column_b))
+            Key {
+                values: ValueTuple::Two(model.get(column_a), model.get(column_b)),
+                exprs: vec![
+                    column_a.save_as(Expr::val(model.get(column_a))),
+                    column_b.save_as(Expr::val(model.get(column_b))),
+                ],
+            }
         }
         Identity::Ternary(a, b, c) => {
             let a = a.to_string();
@@ -383,14 +404,22 @@ where
                     &c.to_string(),
                 )
                 .map_err(|_| DbErr::Type(format!("Failed at mapping '{c}' to column C:3")))?;
-            ValueTuple::Three(
-                model.get(column_a),
-                model.get(column_b),
-                model.get(column_c),
-            )
+            Key {
+                values: ValueTuple::Three(
+                    model.get(column_a),
+                    model.get(column_b),
+                    model.get(column_c),
+                ),
+                exprs: vec![
+                    column_a.save_as(Expr::val(model.get(column_a))),
+                    column_b.save_as(Expr::val(model.get(column_b))),
+                    column_c.save_as(Expr::val(model.get(column_c))),
+                ],
+            }
         }
         Identity::Many(cols) => {
             let mut values = Vec::new();
+            let mut exprs = Vec::new();
             for col in cols {
                 let col_name = col.to_string();
                 let column =
@@ -398,32 +427,34 @@ where
                         &col_name,
                     )
                     .map_err(|_| DbErr::Type(format!("Failed at mapping '{col_name}' to colum")))?;
-                values.push(model.get(column))
+                values.push(model.get(column));
+                exprs.push(column.save_as(Expr::val(model.get(column))))
             }
-            ValueTuple::Many(values)
+            Key {
+                values: ValueTuple::Many(values),
+                exprs,
+            }
         }
     })
 }
 
-fn prepare_condition(table: &TableRef, col: &Identity, keys: &[ValueTuple]) -> Condition {
-    let keys = if !keys.is_empty() {
-        let set: HashSet<_> = keys.iter().cloned().collect();
-        set.into_iter().collect()
-    } else {
-        Vec::new()
-    };
+fn prepare_condition(table: &TableRef, col: &Identity, keys: &Vec<Key>) -> Condition {
+    let keys: Vec<Expr> = keys
+        .into_iter()
+        .map(|m| Expr::Tuple(m.exprs.clone()))
+        .collect();
 
     match col {
         Identity::Unary(column_a) => {
             let column_a = table_column(table, column_a);
-            Condition::all().add(Expr::col(column_a).is_in(keys.into_iter().flatten()))
+            Condition::all().add(Expr::col(column_a).is_in(keys))
         }
         Identity::Binary(column_a, column_b) => Condition::all().add(
             Expr::tuple([
                 SimpleExpr::Column(table_column(table, column_a)),
                 SimpleExpr::Column(table_column(table, column_b)),
             ])
-            .in_tuples(keys),
+            .is_in(keys),
         ),
         Identity::Ternary(column_a, column_b, column_c) => Condition::all().add(
             Expr::tuple([
@@ -431,13 +462,13 @@ fn prepare_condition(table: &TableRef, col: &Identity, keys: &[ValueTuple]) -> C
                 SimpleExpr::Column(table_column(table, column_b)),
                 SimpleExpr::Column(table_column(table, column_c)),
             ])
-            .in_tuples(keys),
+            .is_in(keys),
         ),
         Identity::Many(cols) => {
             let columns = cols
                 .iter()
                 .map(|col| SimpleExpr::Column(table_column(table, col)));
-            Condition::all().add(Expr::tuple(columns).in_tuples(keys))
+            Condition::all().add(Expr::tuple(columns).is_in(keys))
         }
     }
 }
@@ -448,6 +479,8 @@ fn table_column(tbl: &TableRef, col: &DynIden) -> ColumnRef {
 
 #[cfg(test)]
 mod tests {
+    use sea_orm::tests_cfg::sea_orm_active_enums::Tea as DbTea;
+
     fn cake_model(id: i32) -> sea_orm::tests_cfg::cake::Model {
         let name = match id {
             1 => "apple cake",
@@ -496,6 +529,49 @@ mod tests {
         sea_orm::tests_cfg::cake_filling::Model {
             cake_id,
             filling_id,
+        }
+    }
+
+    fn lunch_set_model(id: i32) -> sea_orm::tests_cfg::lunch_set::Model {
+        let tea = if id % 2 == 0 {
+            DbTea::BreakfastTea
+        } else {
+            DbTea::EverydayTea
+        };
+
+        sea_orm::tests_cfg::lunch_set::Model {
+            id,
+            name: "".to_string(),
+            tea,
+        }
+    }
+
+    fn tea_blend_model(tea: DbTea) -> Vec<sea_orm::tests_cfg::tea_blend::Model> {
+        match tea {
+            // English breakfast tea
+            DbTea::BreakfastTea => vec![
+                sea_orm::tests_cfg::tea_blend::Model {
+                    tea: tea.clone(),
+                    blend_part_variety: "Keemun".to_string(),
+                    mass_grams: 8,
+                },
+                sea_orm::tests_cfg::tea_blend::Model {
+                    tea: tea.clone(),
+                    blend_part_variety: "Ceylon".to_string(),
+                    mass_grams: 3,
+                },
+                sea_orm::tests_cfg::tea_blend::Model {
+                    tea,
+                    blend_part_variety: "Assam".to_string(),
+                    mass_grams: 3,
+                },
+            ],
+            // Single variety
+            DbTea::EverydayTea => vec![sea_orm::tests_cfg::tea_blend::Model {
+                tea,
+                blend_part_variety: "DaHongPao".to_string(),
+                mass_grams: 1,
+            }],
         }
     }
 
@@ -754,5 +830,128 @@ mod tests {
 
         let values_count = sql.matches("$1").count() + sql.matches("$2").count();
         assert_eq!(values_count, 2, "Duplicate values were not removed");
+    }
+
+    async fn prepare_load_many_custom_enum_key_real_postgres(
+        test_name: &str,
+    ) -> sea_orm::DatabaseConnection {
+        use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+        let base_url = std::env::var("DATABASE_URL").unwrap();
+
+        let url = format!("{base_url}/postgres");
+        let db = Database::connect(&url).await.unwrap();
+        let _drop_db_result = db
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("DROP DATABASE IF EXISTS \"{test_name}\";"),
+            ))
+            .await;
+
+        let _create_db_result = db
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("CREATE DATABASE \"{test_name}\";"),
+            ))
+            .await;
+
+        let url = format!("{base_url}/{test_name}");
+        let db = Database::connect(&url).await.unwrap();
+
+        db.execute_unprepared(
+            r#"
+                -- Cleanup: Drop tables and types if they exist
+                DROP TABLE IF EXISTS tea_blend CASCADE;
+                DROP TABLE IF EXISTS lunch_set CASCADE;
+                DROP TYPE IF EXISTS tea CASCADE;
+
+                -- Create enum types
+                CREATE TYPE tea AS ENUM ('EverydayTea', 'BreakfastTea');
+
+                -- Create tables
+                CREATE TABLE lunch_set (
+                    id INTEGER PRIMARY KEY,
+                    name VARCHAR NOT NULL,
+                    tea tea NOT NULL
+                );
+
+                CREATE TABLE tea_blend (
+                    tea tea NOT NULL,
+                    blend_part_variety TEXT NOT NULL,
+                    mass_grams INTEGER NOT NULL,
+                    PRIMARY KEY (tea, blend_part_variety)
+                );
+
+                -- Insert lunch_set data
+                INSERT INTO lunch_set (id, name, tea) VALUES 
+                    (0, '', 'BreakfastTea'),
+                    (1, '', 'EverydayTea'),
+                    (2, '', 'BreakfastTea');
+
+                -- Insert tea_blend data
+                -- BreakfastTea blends
+                INSERT INTO tea_blend (tea, blend_part_variety, mass_grams) VALUES 
+                    ('BreakfastTea', 'Keemun', 8),
+                    ('BreakfastTea', 'Ceylon', 3),
+                    ('BreakfastTea', 'Assam', 3);
+
+                -- EverydayTea blends
+                INSERT INTO tea_blend (tea, blend_part_variety, mass_grams) VALUES 
+                    ('EverydayTea', 'DaHongPao', 1);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        db
+    }
+
+    async fn load_many_custom_enum_key(db: &sea_orm::DatabaseConnection) {
+        use sea_orm::{LoaderTrait, entity::prelude::*, tests_cfg::*};
+
+        let lunch_sets = vec![lunch_set_model(0), lunch_set_model(1), lunch_set_model(2)];
+
+        let tea_blends_contents = lunch_sets
+            .load_many(tea_blend::Entity::find(), db)
+            .await
+            .expect("Should return something");
+
+        assert_eq!(
+            tea_blends_contents,
+            [
+                tea_blend_model(DbTea::BreakfastTea),
+                tea_blend_model(DbTea::EverydayTea),
+                tea_blend_model(DbTea::BreakfastTea),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_many_custom_enum_key_real_postgres() {
+        // initializing postgres
+        let db = prepare_load_many_custom_enum_key_real_postgres(
+            "test_load_many_custom_enum_key_real_postgres",
+        )
+        .await;
+
+        // fails
+        load_many_custom_enum_key(&db).await;
+    }
+
+    #[tokio::test]
+    async fn test_load_many_custom_enum_key() {
+        use sea_orm::{DbBackend, MockDatabase};
+
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[
+                tea_blend_model(DbTea::BreakfastTea).into_iter(),
+                tea_blend_model(DbTea::EverydayTea).into_iter(),
+            ]
+            .into_iter()
+            .flatten()])
+            .into_connection();
+
+        // works as intended
+        load_many_custom_enum_key(&db).await;
     }
 }
